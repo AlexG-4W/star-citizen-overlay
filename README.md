@@ -13,6 +13,9 @@
 - **Automated Mapping:** A Python script automatically extracts and maps your personal bindings directly from the game's `actionmaps.xml`.
 - **Debug Mode:** Optional logging for troubleshooting unmapped buttons, with spam-reduction to keep I/O operations lightweight.
 
+- 
+![SCR1](https://github.com/user-attachments/assets/5c0b73bd-4458-4f37-b301-88f022043b2f)
+
 ## 📁 Project Structure
 
 The project is divided into two standalone components:
