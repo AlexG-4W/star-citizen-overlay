@@ -3,15 +3,29 @@ import json
 import logging
 import os
 import re
+import winreg
 
 # Constants
-XML_PATH = r"J:\Roberts Space Industries\StarCitizen\LIVE\USER\Client\0\Profiles\default\actionmaps.xml"
 OUTPUT_JSON_PATH = "mapping.json"
 LOG_FILE = "parser.log"
 
 # Setup logging
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, 
                     format='%(asctime)s - %(levelname)s - %(message)s')
+
+def get_sc_path():
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Roberts Space Industries\RSI Launcher") as key:
+            install_dir, _ = winreg.QueryValueEx(key, "InstallDir")
+            path = os.path.join(install_dir, r"StarCitizen\LIVE\USER\Client\0\Profiles\default\actionmaps.xml")
+            if os.path.exists(path):
+                return path
+    except Exception as e:
+        logging.warning(f"Failed to read registry: {e}")
+    
+    # Fallback to manual input
+    path = input("Could not automatically detect Star Citizen actionmaps.xml path.\nPlease enter the full path to actionmaps.xml: ").strip()
+    return path
 
 def parse_actionmaps(xml_path):
     """Parses actionmaps.xml and returns a dictionary of bindings."""
@@ -74,10 +88,11 @@ def parse_actionmaps(xml_path):
 
 def main():
     logging.info("Starting parser...")
-    logging.info(f"Reading from: {XML_PATH}")
-    print(f"Reading from: {XML_PATH}")
+    xml_path = get_sc_path()
+    logging.info(f"Reading from: {xml_path}")
+    print(f"Reading from: {xml_path}")
 
-    bindings = parse_actionmaps(XML_PATH)
+    bindings = parse_actionmaps(xml_path)
 
     if bindings:
         try:

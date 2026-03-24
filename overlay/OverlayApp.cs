@@ -20,6 +20,9 @@ namespace SCOverlay
         private string _logPath = "overlay.log";
         private NotifyIcon _trayIcon;
         private Timer _topMostTimer;
+        private Font _displayFont;
+        private FileSystemWatcher _watcher;
+        private const long MAX_LOG_SIZE = 5 * 1024 * 1024;
 
         // WinAPI Constants
         private const int GWL_EXSTYLE = -20;
@@ -101,9 +104,12 @@ namespace SCOverlay
             this.BackColor = Color.Black;
             this.Opacity = 0.2;
             this.StartPosition = FormStartPosition.Manual;
+            this.DoubleBuffered = true;
 
             // TransparencyKey is removed for this debug phase to ensure BackColor renders
             this.TransparencyKey = Color.Empty;
+
+            _displayFont = new Font("Arial", 28, FontStyle.Bold);
 
             _topMostTimer = new Timer();
             _topMostTimer.Interval = 1000;
@@ -122,8 +128,19 @@ namespace SCOverlay
 
             SetupTrayIcon();
             LoadMappings();
+            SetupWatcher();
             RegisterDevices();
-            Log("Overlay initialized (64-bit alignment fix + Click-through).");
+            Log("Overlay initialized (64-bit alignment fix + Click-through + Jitter Fix).");
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (_displayFont != null) _displayFont.Dispose();
+                if (_watcher != null) _watcher.Dispose();
+            }
+            base.Dispose(disposing);
         }
 
         protected override CreateParams CreateParams
@@ -151,6 +168,35 @@ namespace SCOverlay
             _trayIcon.ContextMenu = menu;
         }
 
+        private void SetupWatcher()
+        {
+            try
+            {
+                string jsonPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "parser", "mapping.json");
+                string dir = Path.GetDirectoryName(jsonPath);
+                string file = Path.GetFileName(jsonPath);
+                
+                if (Directory.Exists(dir))
+                {
+                    _watcher = new FileSystemWatcher(dir, file);
+                    _watcher.NotifyFilter = NotifyFilters.LastWrite;
+                    _watcher.Changed += (s, e) => {
+                        this.BeginInvoke(new Action(() => {
+                            Log("Mapping file changed. Reloading...");
+                            System.Threading.Thread.Sleep(500); // Give file time to write
+                            LoadMappings();
+                        }));
+                    };
+                    _watcher.EnableRaisingEvents = true;
+                }
+                else
+                {
+                    Log("Watcher setup failed: Directory does not exist - " + dir);
+                }
+            }
+            catch (Exception ex) { Log("Error setting up FileSystemWatcher: " + ex.Message); }
+        }
+
         private void LoadMappings()
         {
             try
@@ -158,13 +204,22 @@ namespace SCOverlay
                 string jsonPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "parser", "mapping.json");
                 if (File.Exists(jsonPath))
                 {
-                    string json = File.ReadAllText(jsonPath);
+                    string json;
+                    using (var fs = new FileStream(jsonPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    using (var sr = new StreamReader(fs, Encoding.UTF8))
+                    {
+                        json = sr.ReadToEnd();
+                    }
                     var serializer = new JavaScriptSerializer();
-                    _mappings = serializer.Deserialize<Dictionary<string, string>>(json);
+                    _mappings = serializer.Deserialize<Dictionary<string, string>>(json) ?? new Dictionary<string, string>();
                     Log(string.Format("DEBUG: Successfully loaded {0} bindings from mapping.json.", _mappings.Count));
                 }
+                else
+                {
+                    Log("Warning: mapping.json not found at " + jsonPath);
+                }
             }
-            catch (Exception ex) { Log("Error loading mappings: " + ex.Message); }
+            catch (Exception ex) { Log("JSON Load Error: " + ex.Message); }
         }
 
         private void RegisterDevices()
@@ -249,13 +304,14 @@ namespace SCOverlay
                     if (GetRawInputData(hRawInput, RID_INPUT, buffer, ref dwSize, (uint)Marshal.SizeOf(typeof(RAWINPUTHEADER))) == dwSize)
                     {
                         RAWINPUT raw = (RAWINPUT)Marshal.PtrToStructure(buffer, typeof(RAWINPUT));
-                        string key = "";
+                        List<string> triggeredActions = new List<string>();
 
                         if (raw.header.dwType == RIM_TYPEKEYBOARD)
                         {
                             bool isKeyDown = (raw.keyboard.Flags & 1) == 0;
+                            bool isE0 = (raw.keyboard.Flags & 2) == 2;
                             Keys vKey = (Keys)raw.keyboard.VKey;
-                            string scKeyName = GetStarCitizenKeyName(vKey);
+                            string scKeyName = GetStarCitizenKeyName(vKey, isE0);
                             string currentKey = "keyboard_" + scKeyName;
 
                             if (isKeyDown)
@@ -263,7 +319,14 @@ namespace SCOverlay
                                 if (!_activeButtons.ContainsKey(currentKey) || !_activeButtons[currentKey])
                                 {
                                     _activeButtons[currentKey] = true;
-                                    key = currentKey;
+                                    if (_mappings.ContainsKey(currentKey))
+                                    {
+                                        triggeredActions.Add(_mappings[currentKey]);
+                                    }
+                                    else if (currentKey.Length > 10)
+                                    {
+                                        Log(string.Format("DEBUG: Lookup failed for [{0}]", currentKey));
+                                    }
                                 }
                             }
                             else
@@ -277,38 +340,57 @@ namespace SCOverlay
                             if (js != null)
                             {
                                 List<int> pressedButtons = new List<int>();
-                                uint pcbSize = 0;
-                                GetRawInputDeviceInfo(raw.header.hDevice, RID_PREPARSEDDATA, IntPtr.Zero, ref pcbSize);
-
-                                if (pcbSize > 0)
+                                try
                                 {
-                                    IntPtr pPreparsedData = Marshal.AllocHGlobal((int)pcbSize);
-                                    try
-                                    {
-                                        if (GetRawInputDeviceInfo(raw.header.hDevice, RID_PREPARSEDDATA, pPreparsedData, ref pcbSize) == pcbSize)
-                                        {
-                                            HIDP_CAPS caps;
-                                            if (HidP_GetCaps(pPreparsedData, out caps) == HIDP_STATUS_SUCCESS)
-                                            {
-                                                ushort[] usages = new ushort[128];
-                                                uint numUsages = 128;
-                                                IntPtr pReport = new IntPtr(buffer.ToInt64() + 32);
-                                                uint reportLength = dwSize - 32;
+                                    uint pcbSize = 0;
+                                    GetRawInputDeviceInfo(raw.header.hDevice, RID_PREPARSEDDATA, IntPtr.Zero, ref pcbSize);
 
-                                                if (HidP_GetUsages(0, 0x09, 0, usages, ref numUsages, pPreparsedData, pReport, reportLength) == HIDP_STATUS_SUCCESS)
+                                    if (pcbSize > 0)
+                                    {
+                                        IntPtr pPreparsedData = Marshal.AllocHGlobal((int)pcbSize);
+                                        try
+                                        {
+                                            if (GetRawInputDeviceInfo(raw.header.hDevice, RID_PREPARSEDDATA, pPreparsedData, ref pcbSize) == pcbSize)
+                                            {
+                                                HIDP_CAPS caps;
+                                                int capsStatus = HidP_GetCaps(pPreparsedData, out caps);
+                                                if (capsStatus == HIDP_STATUS_SUCCESS)
                                                 {
-                                                    for (int i = 0; i < numUsages; i++)
+                                                    ushort[] usages = new ushort[256];
+                                                    uint numUsages = 256;
+                                                    
+                                                    int hidOffset = Marshal.OffsetOf(typeof(RAWINPUT), "hid").ToInt32() + Marshal.OffsetOf(typeof(RAWHID), "bRawData").ToInt32();
+                                                    IntPtr pReport = new IntPtr(buffer.ToInt64() + hidOffset);
+                                                    uint reportLength = dwSize - (uint)hidOffset;
+
+                                                    int usagesStatus = HidP_GetUsages(0, 0x09, 0, usages, ref numUsages, pPreparsedData, pReport, reportLength);
+                                                    if (usagesStatus == HIDP_STATUS_SUCCESS)
                                                     {
-                                                        pressedButtons.Add(usages[i]);
+                                                        for (int i = 0; i < numUsages; i++)
+                                                        {
+                                                            pressedButtons.Add(usages[i]);
+                                                        }
                                                     }
+                                                    else if (usagesStatus != -1072627702) // HIDP_STATUS_INCOMPATIBLE_REPORT_ID
+                                                    {
+                                                        Log("HID Parsing Error (HidP_GetUsages): " + usagesStatus);
+                                                    }
+                                                }
+                                                else
+                                                {
+                                                    Log("HID Parsing Error (HidP_GetCaps): " + capsStatus);
                                                 }
                                             }
                                         }
+                                        finally
+                                        {
+                                            Marshal.FreeHGlobal(pPreparsedData);
+                                        }
                                     }
-                                    finally
-                                    {
-                                        Marshal.FreeHGlobal(pPreparsedData);
-                                    }
+                                }
+                                catch (Exception hidEx)
+                                {
+                                    Log("HID Processing Exception: " + hidEx.Message);
                                 }
                                 
                                 List<string> keysToClear = new List<string>();
@@ -331,28 +413,23 @@ namespace SCOverlay
                                 foreach (int buttonIdx in pressedButtons)
                                 {
                                     string jsKey = string.Format("joystick_{0}_button{1}", js, buttonIdx);
+                                    Log(string.Format("DEBUG HID: Device {0}, Button {1}, Constructed Key: [{2}], Found in Map: {3}", js, buttonIdx, jsKey, _mappings.ContainsKey(jsKey)));
+                                    
                                     if (!_activeButtons.ContainsKey(jsKey) || !_activeButtons[jsKey])
                                     {
                                         _activeButtons[jsKey] = true;
-                                        key = jsKey;
+                                        if (_mappings.ContainsKey(jsKey))
+                                        {
+                                            triggeredActions.Add(_mappings[jsKey]);
+                                        }
                                     }
                                 }
                             }
                         }
 
-                        if (!string.IsNullOrEmpty(key))
+                        if (triggeredActions.Count > 0)
                         {
-                            if (_mappings.ContainsKey(key))
-                            {
-                                ShowText(_mappings[key]);
-                            }
-                            else if (raw.header.dwType == RIM_TYPEKEYBOARD)
-                            {
-                                if (key.Length > 10)
-                                {
-                                    Log(string.Format("DEBUG: Lookup failed for [{0}]", key));
-                                }
-                            }
+                            ShowText(string.Join(" | ", triggeredActions));
                         }
                     }
                 }
@@ -361,7 +438,7 @@ namespace SCOverlay
             catch (Exception ex) { Log("Input error: " + ex.Message); }
         }
 
-        private string GetStarCitizenKeyName(Keys key)
+        private string GetStarCitizenKeyName(Keys key, bool isE0)
         {
             switch (key)
             {
@@ -369,7 +446,7 @@ namespace SCOverlay
                 case Keys.Back: return "backspace"; case Keys.Delete: return "delete";
                 case Keys.Insert: return "insert"; case Keys.Home: return "home";
                 case Keys.End: return "end"; case Keys.Space: return "space";
-                case Keys.Return: return "enter";
+                case Keys.Return: return isE0 ? "np_enter" : "enter";
                 case Keys.Multiply: return "np_multiply";
                 case Keys.OemQuotes: return "apostrophe";
                 case Keys.NumPad0: return "np_0"; case Keys.NumPad1: return "np_1";
@@ -388,9 +465,9 @@ namespace SCOverlay
                 case Keys.F7: return "f7"; case Keys.F8: return "f8";
                 case Keys.F9: return "f9"; case Keys.F10: return "f10";
                 case Keys.F11: return "f11"; case Keys.F12: return "f12";
-                case Keys.ShiftKey: return "lshift"; // fallback
-                case Keys.ControlKey: return "lctrl"; // fallback
-                case Keys.Menu: return "lalt"; // fallback
+                case Keys.ShiftKey: return isE0 ? "rshift" : "lshift";
+                case Keys.ControlKey: return isE0 ? "rctrl" : "lctrl";
+                case Keys.Menu: return isE0 ? "ralt" : "lalt";
                 default: return key.ToString().ToLower();
             }
         }
@@ -406,18 +483,32 @@ namespace SCOverlay
         {
             if (!string.IsNullOrEmpty(_currentText))
             {
-                using (Font font = new Font("Arial", 28, FontStyle.Bold))
-                {
-                    SizeF size = e.Graphics.MeasureString(_currentText, font);
-                    float x = this.Width - size.Width - 50;
-                    float y = this.Height - size.Height - 50;
-                    e.Graphics.DrawString(_currentText, font, Brushes.Black, x + 2, y + 2);
-                    e.Graphics.DrawString(_currentText, font, Brushes.LimeGreen, x, y);
-                }
+                SizeF size = e.Graphics.MeasureString(_currentText, _displayFont);
+                float x = this.Width - size.Width - 50;
+                float y = this.Height - size.Height - 50;
+                e.Graphics.DrawString(_currentText, _displayFont, Brushes.Black, x + 2, y + 2);
+                e.Graphics.DrawString(_currentText, _displayFont, Brushes.LimeGreen, x, y);
             }
         }
 
-        private void Log(string message) { try { File.AppendAllText(_logPath, DateTime.Now + ": " + message + "\r\n"); } catch { } }
+        private void Log(string message) 
+        { 
+            try 
+            { 
+                if (File.Exists(_logPath))
+                {
+                    long length = new FileInfo(_logPath).Length;
+                    if (length > MAX_LOG_SIZE)
+                    {
+                        string bakPath = _logPath + ".bak";
+                        if (File.Exists(bakPath)) File.Delete(bakPath);
+                        File.Move(_logPath, bakPath);
+                    }
+                }
+                File.AppendAllText(_logPath, DateTime.Now + ": " + message + "\r\n"); 
+            } 
+            catch { } 
+        }
 
         [STAThread] public static void Main() { Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false); Application.Run(new OverlayWindow()); }
     }
