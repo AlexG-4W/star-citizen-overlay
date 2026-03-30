@@ -48,7 +48,7 @@ First, you need to create the `mapping.json` file that links physical buttons to
    ```bash
    python parse_actionmaps.py
    ```
-   **Optional CLI Arguments:**
+   **Optional:**
    * `--watch`: Automatically re-parse whenever you change bindings in-game.
    * `--export-html`: Generate a secure, beautiful HTML cheat-sheet inside the directory.
    * `--profile "C:\path\to\layout.xml"`: Point the parser at an exported Star Citizen control profile instead of the default user folder.
