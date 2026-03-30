@@ -1,73 +1,89 @@
 # Star Citizen Overlay (SCOverlay)
 
-**SCOverlay** is a lightweight, external, and transparent overlay for [Star Citizen](https://robertsspaceindustries.com/). It displays the names of in-game actions (e.g., "Landing Gear", "Quantum Drive") on the screen whenever you press the assigned keys on your keyboard, joystick, or gamepad.
+**SCOverlay** is a lightweight, external, and transparent overlay for [Star Citizen](https://robertsspaceindustries.com/). It displays the names of in-game actions (e.g., "Landing Gear", "Quantum Drive") when you press the mapped buttons on your keyboard, joystick, or gamepad.
 
-**The main feature of this project is its strict adherence to safety (Anti-Cheat Safe).** The application operates entirely at the OS level: it does not inject DLLs into the game process and avoids any WinAPI/DirectX function hooking, completely eliminating the risk of Easy Anti-Cheat (EAC) bans.
+**The main feature of this project is its strict Anti-Cheat Safety.** The program operates entirely at the OS-level: it does not inject DLLs into the game process and does not hook DirectX or WinAPI functions, entirely eliminating the risk of Easy Anti-Cheat (EAC) bans.
 
 ## 🚀 Key Features
 
-- **EAC Safe:** Zero injection or hooking. Fully relies on native Windows Raw Input API.
-- **Universal Device Support:** Works seamlessly with keyboards and HID devices (Joysticks, HOSAS, HOTAS, Gamepads) via robust `hid.dll` native parsing.
-- **Unintrusive UI:** Displays text unobtrusively in the bottom-right corner with a transparent, Top-Most window that never steals game focus.
-- **Jitter-Free Input:** Advanced state tracking ensures your overlay won't flash or spam text due to analog axis noise from your HOTAS/HOSAS.
-- **Automated Mapping:** A Python script automatically extracts and maps your personal bindings directly from the game's `actionmaps.xml`.
-- **Debug Mode:** Optional logging for troubleshooting unmapped buttons, with spam-reduction to keep I/O operations lightweight.
-
-- 
-![SCR1](https://github.com/user-attachments/assets/5c0b73bd-4458-4f37-b301-88f022043b2f)
+*   **100% EAC Safe:** No memory injection or hooking. Uses the native Windows Raw Input API.
+*   **Universal Device Support:** Fully supports keyboards, mice, and HID devices (joysticks, gamepads, HOTAS/HOSAS setups).
+*   **Analog Axes Supported:** Reads both digital buttons and analog axes. Advanced deadzone and anti-spam debouncing algorithms prevent UI flickering during throttle or stick movements.
+*   **Non-intrusive UI:** The transparent window stays "always on top". Text appears smoothly upon keypress and vanishes automatically.
+*   **Automatic Parsing:** A Python script automatically extracts your personal bindings directly from the game's `actionmaps.xml` (supports LIVE, PTU, EPTU, and TECH-PREVIEW channels).
+*   **Custom Profiles:** Ability to manually load exported `.xml` control profiles from Star Citizen.
+*   **Unmapped Inputs Mode:** Optional debug UI setting to display buttons that are pressed but have no registered binding.
+*   **Hot-Reloading & Live Config:** Features a `config.json` configuration file to customize font, size, color, duration, and display modes. Both the config and key mappings hot-reload dynamically without requiring an app restart.
+*   **Performance Optimized:** Uses native GDI caching, asynchronous threaded file logging, and debounced file system watchers for minimal performance impact.
 
 ## 📁 Project Structure
 
-The project is divided into two standalone components:
+The project is split into two independent components:
 
-- `parser/` — A Python script (`parse_actionmaps.py`) that parses your Star Citizen control profile (`actionmaps.xml`) and generates a universal `mapping.json` dictionary.
-- `overlay/` — A C# (.NET/WinForms) desktop application (`OverlayApp.exe`) that runs in the background, asynchronously reads your physical inputs, and draws the corresponding action names on-screen.
+*   `parser/`: A Python script (`parse_actionmaps.py`) that parses your Star Citizen control profile (`actionmaps.xml`) and generates a universal `mapping.json` dictionary. It can also generate an HTML Cheat Sheet.
+*   `overlay/`: A C# background application (.NET/WinForms) (`OverlayApp.exe`) that listens to raw user input asynchronously and renders the text on screen.
 
 ## 🛠 Requirements
 
-- **OS:** Windows 10 / 11
-- **Parser:** Python 3.x
-- **Overlay:** .NET Framework 4.0 or higher (pre-installed on modern Windows)
+*   **OS:** Windows 10 / 11
+*   **Parser:** Python 3.x
+*   **Overlay:** .NET Framework 4.0 or higher (pre-installed on modern Windows versions)
 
-## 📖 Setup and Usage Instructions
+## 📖 Installation and Usage
 
 ### Step 1: Prepare the Mapping (Parser)
-First, you need to generate the `mapping.json` file, which links physical hardware buttons to the in-game actions from your personal profile.
+First, you need to create the `mapping.json` file that links physical buttons to in-game actions according to your game profile.
 
-1. Open a terminal or command prompt and navigate to the parser directory:
+1. Open your terminal (or Command Prompt) and navigate to the parser directory:
    ```bash
-   cd parser
+   cd SCOverlay/parser
    ```
-2. Open `parse_actionmaps.py` in any text editor and ensure the path variable (e.g., `REAL_XML_PATH`) correctly points to your Star Citizen profile file (usually located at `USER/Client/0/Profiles/default/actionmaps.xml`).
-3. Run the parser:
+2. Run the parser script. It will automatically attempt to find your `actionmaps.xml` from the registry across all game channels (LIVE, PTU, EPTU, etc.).
    ```bash
    python parse_actionmaps.py
    ```
-   A `mapping.json` file will be successfully generated in the `parser` directory.
+   **Optional CLI Arguments:**
+   * `--watch`: Automatically re-parse whenever you change bindings in-game.
+   * `--export-html`: Generate a secure, beautiful HTML cheat-sheet inside the directory.
+   * `--profile "C:\path\to\layout.xml"`: Point the parser at an exported Star Citizen control profile instead of the default user folder.
+3. The `mapping.json` file will be created in the `parser` folder.
 
-### Step 2: Run the Overlay
-1. Navigate to the overlay directory:
+### Step 2: Configure & Launch the Overlay
+1. Open `config.json` inside the `parser` directory to tweak visual settings:
+   ```json
+   {
+       "font_name": "Arial",
+       "font_size": 28,
+       "position": "bottom-right",
+       "display_duration_ms": 2000,
+       "text_color": "39FF14",
+       "show_unmapped_inputs": false 
+   }
+   ```
+   *Tip:* Set `"show_unmapped_inputs": true` if you want the overlay to display raw button presses (e.g. "Keyboard W", "JS1 BUTTON5") even if they lack an in-game binding.
+2. Navigate to the overlay directory:
    ```bash
    cd ../overlay
    ```
-2. Launch `OverlayApp.exe`.
-   - The overlay will automatically load `mapping.json`.
-   - The application runs hidden in a "Top-Most" state without activating or stealing focus. You can find its icon in the System Tray to exit the app (Right Click -> Exit).
+3. Launch `OverlayApp.exe`.
+   * The overlay will automatically load `mapping.json` and `config.json`.
+   * The app runs in hidden mode "always on top". You can interact with it via its System Tray icon (Right Click -> Status / Reload / View Log / Exit).
 
-## 🐛 Troubleshooting
+## 🐛 Troubleshooting & Debugging
 
-- **Overlay Visualization:** By default, the window may have a slight opacity to help you confirm it is rendering over the game.
-- **Logging (`overlay.log`):** The application records input events into `overlay.log` inside the `overlay/` folder.
-  - Standard keys that aren't mapped are ignored to prevent log flooding.
-  - If a specific joystick button doesn't trigger the text, check the log to see its registered hardware ID and ensure it matches the generated Python JSON.
+*   **Overlay Visibility:** By default, the window uses chroma-key transparency to stay completely invisible. If you don't see anything, check if you are playing in Borderless Windowed or Windowed mode. Exclusive Fullscreen might hide the overlay.
+*   **Logs (`overlay.log`):** The app records captured inputs to an asynchronous log queue. If an action isn't displayed:
+    * *Success example:* `DEBUG: RawInput received. WinForms Key: OemQuotes, Converted String: keyboard_apostrophe`
+    * *Error example:* `DEBUG: Lookup failed for [keyboard_apostrophe]` (Enable `show_unmapped_inputs` or ensure the parser mapped it).
+*   **Missing Device Axes/Keys:** Ensure your device is correctly recognized by looking at the logs. Device disconnections and hot-plugging are handled safely without leaving lingering memory blocks.
 
-## 👨‍💻 Compiling from Source
+## 👨‍💻 Building from Source
 
-The project uses the default C# compiler (`csc.exe`) bundled with Windows. You do not need Visual Studio to build it.
+The project relies on the basic C# compiler (`csc.exe`) bundled with Windows. You don't need Visual Studio to build it.
 
-To compile the executable from source, run this in PowerShell:
+To compile the `.exe` file, run this inside PowerShell:
 ```powershell
-& "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /out:"OverlayApp.exe" "OverlayApp.cs" /reference:System.Windows.Forms.dll,System.Drawing.dll,System.Web.Extensions.dll
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:"OverlayApp.exe" "OverlayApp.cs"
 ```
 
 ---

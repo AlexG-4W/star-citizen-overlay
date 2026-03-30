@@ -17,12 +17,38 @@ namespace SCOverlay
         private Dictionary<string, string> _mappings = new Dictionary<string, string>();
         private Dictionary<IntPtr, string> _deviceToJsMap = new Dictionary<IntPtr, string>();
         private Dictionary<string, bool> _activeButtons = new Dictionary<string, bool>();
-        private string _logPath = "overlay.log";
+        // Cache preparsed HID data per device — avoids AllocHGlobal on every raw input event
+        private Dictionary<IntPtr, IntPtr> _preparsedDataCache = new Dictionary<IntPtr, IntPtr>();
+        
+        // Anti-Spam state for axes
+        private Dictionary<string, uint> _lastAxisValues = new Dictionary<string, uint>();
+        private Dictionary<string, DateTime> _axisLastTrigger = new Dictionary<string, DateTime>();
+        
+        private System.Threading.Timer _fswDebounceTimer;
+        private string _logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "overlay.log");
         private NotifyIcon _trayIcon;
         private Timer _topMostTimer;
         private Font _displayFont;
+        // GDI Caches
+        private Brush _textBrush;
+        private Brush _shadowBrush;
         private FileSystemWatcher _watcher;
         private const long MAX_LOG_SIZE = 5 * 1024 * 1024;
+        
+        // Async Logging
+        private System.Collections.Concurrent.ConcurrentQueue<string> _logQueue = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        private System.Threading.Timer _logFlushTimer;
+
+        // Config-driven UI settings with defaults
+        private string _cfgFontName = "Arial";
+        private int _cfgFontSize = 28;
+        private string _cfgPosition = "bottom-right"; // "bottom-right" or "center"
+        private int _cfgDisplayDurationMs = 2000;
+        private Color _cfgTextColor = Color.LimeGreen;
+        private bool _cfgShowUnmappedInputs = false;
+
+        // Tray menu item references for dynamic updates
+        private MenuItem _statusMenuItem;
 
         // WinAPI Constants
         private const int GWL_EXSTYLE = -20;
@@ -39,12 +65,14 @@ namespace SCOverlay
 
         // Raw Input Constants
         private const int WM_INPUT = 0x00FF;
+        private const int WM_INPUT_DEVICE_CHANGE = 0x00FE;
         private const int RID_INPUT = 0x10000003;
         private const int RID_DEVICENAME = 0x20000007;
         private const int RID_PREPARSEDDATA = 0x20000005;
         private const int RIM_TYPEKEYBOARD = 1;
         private const int RIM_TYPEHID = 2;
         private const int RIDEV_INPUTSINK = 0x00000100;
+        private const int RIDEV_DEVNOTIFY = 0x00002000;
 
         [StructLayout(LayoutKind.Sequential)]
         struct RAWINPUTDEVICE
@@ -77,11 +105,67 @@ namespace SCOverlay
             public ushort NumberFeatureDataIndices;
         }
 
+        [StructLayout(LayoutKind.Explicit)]
+        public struct HIDP_VALUE_CAPS
+        {
+            [FieldOffset(0)] public ushort UsagePage;
+            [FieldOffset(2)] public byte ReportID;
+            [FieldOffset(3), MarshalAs(UnmanagedType.U1)] public bool IsAlias;
+            [FieldOffset(4)] public ushort BitField;
+            [FieldOffset(6)] public ushort LinkCollection;
+            [FieldOffset(8)] public ushort LinkUsage;
+            [FieldOffset(10)] public ushort LinkUsagePage;
+            [FieldOffset(12), MarshalAs(UnmanagedType.U1)] public bool IsRange;
+            [FieldOffset(13), MarshalAs(UnmanagedType.U1)] public bool IsStringRange;
+            [FieldOffset(14), MarshalAs(UnmanagedType.U1)] public bool IsDesignatorRange;
+            [FieldOffset(15), MarshalAs(UnmanagedType.U1)] public bool IsAbsolute;
+            [FieldOffset(16), MarshalAs(UnmanagedType.U1)] public bool HasNull;
+            [FieldOffset(17)] public byte Reserved;
+            [FieldOffset(18)] public ushort BitSize;
+            [FieldOffset(20)] public ushort ReportCount;
+            // Reserved2 is 5 ushorts (10 bytes) offset 22
+            [FieldOffset(22)] public ushort Reserved2_0;
+            [FieldOffset(24)] public ushort Reserved2_1;
+            [FieldOffset(26)] public ushort Reserved2_2;
+            [FieldOffset(28)] public ushort Reserved2_3;
+            [FieldOffset(30)] public ushort Reserved2_4;
+            [FieldOffset(32)] public uint UnitsExp;
+            [FieldOffset(36)] public uint Units;
+            [FieldOffset(40)] public int LogicalMin;
+            [FieldOffset(44)] public int LogicalMax;
+            [FieldOffset(48)] public int PhysicalMin;
+            [FieldOffset(52)] public int PhysicalMax;
+            // Range (Start of Union)
+            [FieldOffset(56)] public ushort UsageMin;
+            [FieldOffset(58)] public ushort UsageMax;
+            [FieldOffset(60)] public ushort StringMin;
+            [FieldOffset(62)] public ushort StringMax;
+            [FieldOffset(64)] public ushort DesignatorMin;
+            [FieldOffset(66)] public ushort DesignatorMax;
+            [FieldOffset(68)] public ushort DataIndexMin;
+            [FieldOffset(70)] public ushort DataIndexMax;
+            // NotRange (Overlapping Union)
+            [FieldOffset(56)] public ushort Usage;
+            [FieldOffset(58)] public ushort Reserved1_0;
+            [FieldOffset(60)] public ushort StringIndex;
+            [FieldOffset(62)] public ushort Reserved2_A;
+            [FieldOffset(64)] public ushort DesignatorIndex;
+            [FieldOffset(66)] public ushort Reserved3_0;
+            [FieldOffset(68)] public ushort DataIndex;
+            [FieldOffset(70)] public ushort Reserved4_0;
+        }
+
         [DllImport("hid.dll", SetLastError = true)]
         private static extern int HidP_GetCaps(IntPtr PreparsedData, out HIDP_CAPS Capabilities);
 
         [DllImport("hid.dll", SetLastError = true)]
         private static extern int HidP_GetUsages(int ReportType, ushort UsagePage, ushort LinkCollection, [In, Out] ushort[] UsageList, ref uint UsageLength, IntPtr PreparsedData, IntPtr Report, uint ReportLength);
+
+        [DllImport("hid.dll", SetLastError = true)]
+        private static extern int HidP_GetValueCaps(int ReportType, [In, Out] HIDP_VALUE_CAPS[] ValueCaps, ref ushort ValueCapsLength, IntPtr PreparsedData);
+
+        [DllImport("hid.dll", SetLastError = true)]
+        private static extern int HidP_GetUsageValue(int ReportType, ushort UsagePage, ushort LinkCollection, ushort Usage, out uint UsageValue, IntPtr PreparsedData, IntPtr Report, uint ReportLength);
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] pRawInputDevices, uint uiNumDevices, uint cbSize);
@@ -101,15 +185,17 @@ namespace SCOverlay
             this.WindowState = FormWindowState.Maximized;
             this.TopMost = true;
             this.ShowInTaskbar = false;
-            this.BackColor = Color.Black;
-            this.Opacity = 0.2;
+            // Production chroma-key transparency: near-black (1,1,1) is the "hole"
+            this.BackColor = Color.FromArgb(1, 1, 1);
+            this.TransparencyKey = Color.FromArgb(1, 1, 1);
+            this.Opacity = 1.0;   // Must be 1.0 when using TransparencyKey
             this.StartPosition = FormStartPosition.Manual;
             this.DoubleBuffered = true;
 
-            // TransparencyKey is removed for this debug phase to ensure BackColor renders
-            this.TransparencyKey = Color.Empty;
+            // Load config first so font/color/position are set before first paint
+            LoadConfig();
 
-            _displayFont = new Font("Arial", 28, FontStyle.Bold);
+            _displayFont = new Font(_cfgFontName, _cfgFontSize, FontStyle.Bold);
 
             _topMostTimer = new Timer();
             _topMostTimer.Interval = 1000;
@@ -119,12 +205,18 @@ namespace SCOverlay
             _topMostTimer.Start();
 
             _clearTimer = new Timer();
-            _clearTimer.Interval = 2000;
+            _clearTimer.Interval = _cfgDisplayDurationMs;
             _clearTimer.Tick += (s, e) => {
                 _currentText = "";
                 this.Invalidate();
                 _clearTimer.Stop();
             };
+
+            _shadowBrush = new SolidBrush(Color.Black);
+            _textBrush = new SolidBrush(_cfgTextColor);
+
+            _fswDebounceTimer = new System.Threading.Timer(FswDebounceTimerCallback, null, System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
+            _logFlushTimer = new System.Threading.Timer(LogFlushCallback, null, 100, 100);
 
             SetupTrayIcon();
             LoadMappings();
@@ -139,6 +231,14 @@ namespace SCOverlay
             {
                 if (_displayFont != null) _displayFont.Dispose();
                 if (_watcher != null) _watcher.Dispose();
+                if (_textBrush != null) _textBrush.Dispose();
+                if (_shadowBrush != null) _shadowBrush.Dispose();
+                if (_fswDebounceTimer != null) _fswDebounceTimer.Dispose();
+                if (_logFlushTimer != null)
+                {
+                    _logFlushTimer.Dispose();
+                    FlushLogQueue();
+                }
             }
             base.Dispose(disposing);
         }
@@ -153,6 +253,102 @@ namespace SCOverlay
             }
         }
 
+        // -------------------------------------------------------------------
+        //  Config loading (config.json)
+        // -------------------------------------------------------------------
+
+        private string GetParserDir()
+        {
+            return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "parser"));
+        }
+
+        private void LoadConfig()
+        {
+            try
+            {
+                string configPath = Path.Combine(GetParserDir(), "config.json");
+                if (!File.Exists(configPath))
+                {
+                    Log("config.json not found, using defaults.");
+                    return;
+                }
+
+                string json;
+                using (var fs = new FileStream(configPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (var sr = new StreamReader(fs, Encoding.UTF8))
+                {
+                    json = sr.ReadToEnd();
+                }
+
+                var serializer = new JavaScriptSerializer();
+                var cfg = serializer.Deserialize<Dictionary<string, object>>(json);
+                if (cfg == null) return;
+
+                object val;
+                if (cfg.TryGetValue("font_name", out val) && val is string)
+                    _cfgFontName = (string)val;
+
+                if (cfg.TryGetValue("font_size", out val))
+                {
+                    try
+                    {
+                        int parsed = Convert.ToInt32(val);
+                        if (parsed >= 8 && parsed <= 200) _cfgFontSize = parsed;
+                    }
+                    catch { Log("Warning: invalid font_size in config.json, using default."); }
+                }
+
+                if (cfg.TryGetValue("position", out val) && val is string)
+                    _cfgPosition = ((string)val).ToLower();
+
+                if (cfg.TryGetValue("display_duration_ms", out val) && val is int)
+                    _cfgDisplayDurationMs = (int)val;
+
+                if (cfg.TryGetValue("text_color", out val) && val is string)
+                {
+                    try
+                    {
+                        string hex = ((string)val).Trim();
+                        if (hex.StartsWith("#")) hex = hex.Substring(1);
+                        int r = Convert.ToInt32(hex.Substring(0, 2), 16);
+                        int g = Convert.ToInt32(hex.Substring(2, 2), 16);
+                        int b = Convert.ToInt32(hex.Substring(4, 2), 16);
+                        _cfgTextColor = Color.FromArgb(r, g, b);
+                    }
+                    catch { Log("Warning: invalid text_color in config.json, using default."); }
+                }
+
+                if (cfg.TryGetValue("show_unmapped_inputs", out val) && val is bool)
+                    _cfgShowUnmappedInputs = (bool)val;
+
+                Log(string.Format("Config loaded: font={0} {1}pt, position={2}, duration={3}ms, color={4}, unmapped={5}",
+                    _cfgFontName, _cfgFontSize, _cfgPosition, _cfgDisplayDurationMs, _cfgTextColor.Name, _cfgShowUnmappedInputs));
+            }
+            catch (Exception ex) { Log("Config Load Error: " + ex.Message); }
+        }
+
+        private void ApplyConfig()
+        {
+            LoadConfig();
+
+            // Rebuild font
+            if (_displayFont != null) _displayFont.Dispose();
+            _displayFont = new Font(_cfgFontName, _cfgFontSize, FontStyle.Bold);
+            
+            if (_textBrush != null) _textBrush.Dispose();
+            _textBrush = new SolidBrush(_cfgTextColor);
+
+            // Update clear timer interval
+            _clearTimer.Interval = _cfgDisplayDurationMs;
+
+            this.Invalidate();
+            Log("Config applied.");
+        }
+
+        // -------------------------------------------------------------------
+        //  Tray icon with enhanced menu
+        // -------------------------------------------------------------------
+
         private void SetupTrayIcon()
         {
             _trayIcon = new NotifyIcon();
@@ -160,7 +356,33 @@ namespace SCOverlay
             _trayIcon.Text = "SC Key Overlay";
             _trayIcon.Visible = true;
 
+            _statusMenuItem = new MenuItem(string.Format("Loaded: {0} bindings", _mappings.Count));
+            _statusMenuItem.Enabled = false;
+
             ContextMenu menu = new ContextMenu();
+            menu.MenuItems.Add(_statusMenuItem);
+            menu.MenuItems.Add("-"); // separator
+            menu.MenuItems.Add("Reload Mappings && Config", (s, e) => {
+                LoadMappings();
+                ApplyConfig();
+                Log("Manual reload triggered from tray menu.");
+            });
+            menu.MenuItems.Add("Open Log", (s, e) => {
+                try
+                {
+                    string logFullPath = Path.GetFullPath(_logPath);
+                    if (File.Exists(logFullPath))
+                    {
+                        System.Diagnostics.Process.Start("notepad.exe", logFullPath);
+                    }
+                    else
+                    {
+                        Log("Log file does not exist yet: " + logFullPath);
+                    }
+                }
+                catch (Exception ex) { Log("Failed to open log: " + ex.Message); }
+            });
+            menu.MenuItems.Add("-"); // separator
             menu.MenuItems.Add("Exit", (s, e) => {
                 _trayIcon.Visible = false;
                 Application.Exit();
@@ -168,24 +390,38 @@ namespace SCOverlay
             _trayIcon.ContextMenu = menu;
         }
 
+        private void UpdateStatusMenuItem()
+        {
+            if (_statusMenuItem != null)
+            {
+                // Count only real bindings, not __device_ entries
+                int count = 0;
+                foreach (var kvp in _mappings)
+                {
+                    if (!kvp.Key.StartsWith("__device_")) count++;
+                }
+                _statusMenuItem.Text = string.Format("Loaded: {0} bindings", count);
+            }
+        }
+
+        // -------------------------------------------------------------------
+        //  FileSystemWatcher — watches mapping.json AND config.json
+        // -------------------------------------------------------------------
+
         private void SetupWatcher()
         {
             try
             {
-                string jsonPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "parser", "mapping.json");
-                string dir = Path.GetDirectoryName(jsonPath);
-                string file = Path.GetFileName(jsonPath);
-                
+                string dir = GetParserDir();
+
                 if (Directory.Exists(dir))
                 {
-                    _watcher = new FileSystemWatcher(dir, file);
+                    _watcher = new FileSystemWatcher(dir, "*.json");
                     _watcher.NotifyFilter = NotifyFilters.LastWrite;
                     _watcher.Changed += (s, e) => {
-                        this.BeginInvoke(new Action(() => {
-                            Log("Mapping file changed. Reloading...");
-                            System.Threading.Thread.Sleep(500); // Give file time to write
-                            LoadMappings();
-                        }));
+                        // Restart debounce timer on any change
+                        // Wait 500ms after the LAST change event
+                        if (_fswDebounceTimer != null) _fswDebounceTimer.Change(500, System.Threading.Timeout.Infinite);
                     };
                     _watcher.EnableRaisingEvents = true;
                 }
@@ -197,11 +433,25 @@ namespace SCOverlay
             catch (Exception ex) { Log("Error setting up FileSystemWatcher: " + ex.Message); }
         }
 
+        private void FswDebounceTimerCallback(object state)
+        {
+            if (this.IsDisposed || !this.IsHandleCreated) return;
+            this.BeginInvoke(new Action(() => {
+                Log("File changed. Reloading mappings and config...");
+                LoadMappings();
+                ApplyConfig();
+            }));
+        }
+
+        // -------------------------------------------------------------------
+        //  Mapping loading
+        // -------------------------------------------------------------------
+
         private void LoadMappings()
         {
             try
             {
-                string jsonPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "parser", "mapping.json");
+                string jsonPath = Path.Combine(GetParserDir(), "mapping.json");
                 if (File.Exists(jsonPath))
                 {
                     string json;
@@ -212,7 +462,8 @@ namespace SCOverlay
                     }
                     var serializer = new JavaScriptSerializer();
                     _mappings = serializer.Deserialize<Dictionary<string, string>>(json) ?? new Dictionary<string, string>();
-                    Log(string.Format("DEBUG: Successfully loaded {0} bindings from mapping.json.", _mappings.Count));
+                    Log(string.Format("Successfully loaded {0} bindings from mapping.json.", _mappings.Count));
+                    UpdateStatusMenuItem();
                 }
                 else
                 {
@@ -222,11 +473,19 @@ namespace SCOverlay
             catch (Exception ex) { Log("JSON Load Error: " + ex.Message); }
         }
 
+        // -------------------------------------------------------------------
+        //  Raw Input device registration
+        // -------------------------------------------------------------------
+
         private void RegisterDevices()
         {
-            RAWINPUTDEVICE[] rid = new RAWINPUTDEVICE[2];
-            rid[0].usUsagePage = 0x01; rid[0].usUsage = 0x06; rid[0].dwFlags = RIDEV_INPUTSINK; rid[0].hwndTarget = this.Handle;
-            rid[1].usUsagePage = 0x01; rid[1].usUsage = 0x04; rid[1].dwFlags = RIDEV_INPUTSINK; rid[1].hwndTarget = this.Handle;
+            // Register keyboard + joystick + gamepad + multi-axis, with device-change notifications
+            RAWINPUTDEVICE[] rid = new RAWINPUTDEVICE[4];
+            uint flags = (uint)(RIDEV_INPUTSINK | RIDEV_DEVNOTIFY);
+            rid[0].usUsagePage = 0x01; rid[0].usUsage = 0x06; rid[0].dwFlags = flags; rid[0].hwndTarget = this.Handle; // Keyboard
+            rid[1].usUsagePage = 0x01; rid[1].usUsage = 0x04; rid[1].dwFlags = flags; rid[1].hwndTarget = this.Handle; // Joystick
+            rid[2].usUsagePage = 0x01; rid[2].usUsage = 0x05; rid[2].dwFlags = flags; rid[2].hwndTarget = this.Handle; // Gamepad
+            rid[3].usUsagePage = 0x01; rid[3].usUsage = 0x08; rid[3].dwFlags = flags; rid[3].hwndTarget = this.Handle; // Multi-axis
 
             if (!RegisterRawInputDevices(rid, (uint)rid.Length, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE))))
             {
@@ -262,15 +521,11 @@ namespace SCOverlay
                     string jsInstance = mapping.Key.Replace("__device_", ""); // e.g. js3
                     string productInfo = mapping.Value.ToUpper();
                     
-                    var match = Regex.Match(productInfo, @"\{([0-9A-F]{4})([0-9A-F]{4})-");
+                    var match = Regex.Match(productInfo, @"\{([0-9A-F]{4})([0-9A-F]{4})-[0-9A-F]{4}-");
                     if (match.Success)
                     {
-                        string pid = match.Groups[1].Value;
-                        string vid = match.Groups[2].Value;
-                        
-                        if (devicePath.Contains(string.Format("VID_{0}&PID_{1}", vid, pid)) ||
-                            devicePath.Contains(string.Format("VID_{0}&PID_{1}", pid, vid)) ||
-                            devicePath.Contains(string.Format("VID_{1}&PID_{0}", pid, vid)))
+                        string searchStr = string.Format("VID_{0}&PID_{1}", match.Groups[2].Value, match.Groups[1].Value);
+                        if (devicePath.Contains(searchStr))
                         {
                             _deviceToJsMap[hDevice] = jsInstance;
                             Log(string.Format("Matched {0} to {1} (Path: {2})", jsInstance, productInfo, devicePath));
@@ -282,9 +537,32 @@ namespace SCOverlay
             return null;
         }
 
+        // -------------------------------------------------------------------
+        //  WndProc / Raw Input processing
+        // -------------------------------------------------------------------
+
         protected override void WndProc(ref Message m)
         {
-            if (m.Msg == WM_INPUT) ProcessRawInput(m.LParam);
+            if (m.Msg == WM_INPUT)
+            {
+                ProcessRawInput(m.LParam);
+            }
+            else if (m.Msg == WM_INPUT_DEVICE_CHANGE)
+            {
+                if (m.WParam.ToInt32() == 2) // GIDC_REMOVAL
+                {
+                    // Device disconnected — evict its cached entries so stale handles don't linger
+                    IntPtr hDevice = m.LParam;
+                    IntPtr pPreparsed;
+                    if (_preparsedDataCache.TryGetValue(hDevice, out pPreparsed))
+                    {
+                        Marshal.FreeHGlobal(pPreparsed);
+                        _preparsedDataCache.Remove(hDevice);
+                    }
+                    _deviceToJsMap.Remove(hDevice);
+                    Log(string.Format("Device disconnected/changed: 0x{0:X}", hDevice.ToInt64()));
+                }
+            }
             base.WndProc(ref m);
         }
 
@@ -325,6 +603,10 @@ namespace SCOverlay
                                     }
                                     else if (currentKey.Length > 10)
                                     {
+                                        if (_cfgShowUnmappedInputs)
+                                        {
+                                            triggeredActions.Add("Keyboard " + currentKey.Replace("keyboard_", "").ToUpper());
+                                        }
                                         Log(string.Format("DEBUG: Lookup failed for [{0}]", currentKey));
                                     }
                                 }
@@ -342,50 +624,146 @@ namespace SCOverlay
                                 List<int> pressedButtons = new List<int>();
                                 try
                                 {
-                                    uint pcbSize = 0;
-                                    GetRawInputDeviceInfo(raw.header.hDevice, RID_PREPARSEDDATA, IntPtr.Zero, ref pcbSize);
-
-                                    if (pcbSize > 0)
+                                    // Use cached preparsed data — avoids AllocHGlobal on every HID event
+                                    IntPtr pPreparsedData;
+                                    if (!_preparsedDataCache.TryGetValue(raw.header.hDevice, out pPreparsedData))
                                     {
-                                        IntPtr pPreparsedData = Marshal.AllocHGlobal((int)pcbSize);
-                                        try
+                                        uint pcbSize = 0;
+                                        GetRawInputDeviceInfo(raw.header.hDevice, RID_PREPARSEDDATA, IntPtr.Zero, ref pcbSize);
+                                        if (pcbSize > 0)
                                         {
+                                            pPreparsedData = Marshal.AllocHGlobal((int)pcbSize);
                                             if (GetRawInputDeviceInfo(raw.header.hDevice, RID_PREPARSEDDATA, pPreparsedData, ref pcbSize) == pcbSize)
                                             {
-                                                HIDP_CAPS caps;
-                                                int capsStatus = HidP_GetCaps(pPreparsedData, out caps);
-                                                if (capsStatus == HIDP_STATUS_SUCCESS)
-                                                {
-                                                    ushort[] usages = new ushort[256];
-                                                    uint numUsages = 256;
-                                                    
-                                                    int hidOffset = Marshal.OffsetOf(typeof(RAWINPUT), "hid").ToInt32() + Marshal.OffsetOf(typeof(RAWHID), "bRawData").ToInt32();
-                                                    IntPtr pReport = new IntPtr(buffer.ToInt64() + hidOffset);
-                                                    uint reportLength = dwSize - (uint)hidOffset;
+                                                _preparsedDataCache[raw.header.hDevice] = pPreparsedData;
+                                            }
+                                            else
+                                            {
+                                                Marshal.FreeHGlobal(pPreparsedData);
+                                                pPreparsedData = IntPtr.Zero;
+                                            }
+                                        }
+                                        else { pPreparsedData = IntPtr.Zero; }
+                                    }
 
-                                                    int usagesStatus = HidP_GetUsages(0, 0x09, 0, usages, ref numUsages, pPreparsedData, pReport, reportLength);
-                                                    if (usagesStatus == HIDP_STATUS_SUCCESS)
+                                    if (pPreparsedData != IntPtr.Zero)
+                                    {
+                                        HIDP_CAPS caps;
+                                        int capsStatus = HidP_GetCaps(pPreparsedData, out caps);
+                                        if (capsStatus == HIDP_STATUS_SUCCESS)
+                                        {
+                                            ushort[] usages = new ushort[256];
+                                            uint numUsages = 256;
+
+                                            int hidOffset = Marshal.OffsetOf(typeof(RAWINPUT), "hid").ToInt32() + Marshal.OffsetOf(typeof(RAWHID), "bRawData").ToInt32();
+                                            IntPtr pReport = new IntPtr(buffer.ToInt64() + hidOffset);
+                                            uint reportLength = raw.hid.dwSizeHid;
+
+                                            int usagesStatus = HidP_GetUsages(0, 0x09, 0, usages, ref numUsages, pPreparsedData, pReport, reportLength);
+                                            if (usagesStatus == HIDP_STATUS_SUCCESS)
+                                            {
+                                                for (int i = 0; i < numUsages; i++)
+                                                    pressedButtons.Add(usages[i]);
+                                            }
+                                            else if (usagesStatus != -1072627702) // HIDP_STATUS_INCOMPATIBLE_REPORT_ID
+                                            {
+                                                Log("HID Parsing Error (HidP_GetUsages): " + usagesStatus);
+                                            }
+                                            
+                                            // Process Analog Axes (UsagePage 0x01)
+                                            if (caps.NumberInputValueCaps > 0)
+                                            {
+                                                ushort numValueCaps = caps.NumberInputValueCaps;
+                                                HIDP_VALUE_CAPS[] valueCaps = new HIDP_VALUE_CAPS[numValueCaps];
+                                                if (HidP_GetValueCaps(0, valueCaps, ref numValueCaps, pPreparsedData) == HIDP_STATUS_SUCCESS)
+                                                {
+                                                    for (int i = 0; i < numValueCaps; i++)
                                                     {
-                                                        for (int i = 0; i < numUsages; i++)
+                                                        var vc = valueCaps[i];
+                                                        if (vc.UsagePage == 0x01 && !vc.IsRange)
                                                         {
-                                                            pressedButtons.Add(usages[i]);
+                                                            uint currentValue;
+                                                            if (HidP_GetUsageValue(0, vc.UsagePage, 0, vc.Usage, out currentValue, pPreparsedData, pReport, reportLength) == HIDP_STATUS_SUCCESS)
+                                                            {
+                                                                string axisSuffix = null;
+                                                                switch (vc.Usage)
+                                                                {
+                                                                    case 0x30: axisSuffix = "x"; break;
+                                                                    case 0x31: axisSuffix = "y"; break;
+                                                                    case 0x32: axisSuffix = "z"; break;
+                                                                    case 0x33: axisSuffix = "rotx"; break; // rx
+                                                                    case 0x34: axisSuffix = "roty"; break; // ry
+                                                                    case 0x35: axisSuffix = "rotz"; break; // rz
+                                                                    case 0x36: axisSuffix = "slider"; break;
+                                                                }
+
+                                                                if (axisSuffix != null)
+                                                                {
+                                                                    string axisKey = string.Format("joystick_{0}_{1}", js, axisSuffix);
+                                                                    
+                                                                    // Determine delta & deadzone
+                                                                    long range = (long)vc.LogicalMax - (long)vc.LogicalMin;
+                                                                    if (range <= 0) range = 65535; // safe fallback
+                                                                    
+                                                                    uint lastVal = 0;
+                                                                    if (_lastAxisValues.ContainsKey(axisKey)) lastVal = _lastAxisValues[axisKey];
+                                                                    
+                                                                    long delta = Math.Abs((long)currentValue - (long)lastVal);
+                                                                    bool significantChange = delta > (range * 0.05); // 5% delta required
+                                                                    
+                                                                    long center = ((long)vc.LogicalMax + (long)vc.LogicalMin) / 2;
+                                                                    long distFromCenter = Math.Abs((long)currentValue - center);
+                                                                    bool outsideDeadzone = distFromCenter > (range * 0.10); // 10% deadzone
+
+                                                                    if (significantChange && outsideDeadzone)
+                                                                    {
+                                                                        _lastAxisValues[axisKey] = currentValue;
+                                                                        
+                                                                        // Check debounce (1.5 seconds)
+                                                                        DateTime now = DateTime.UtcNow;
+                                                                        bool canTrigger = true;
+                                                                        if (_axisLastTrigger.ContainsKey(axisKey))
+                                                                        {
+                                                                            if ((now - _axisLastTrigger[axisKey]).TotalSeconds < 1.5)
+                                                                            {
+                                                                                canTrigger = false;
+                                                                            }
+                                                                        }
+                                                                        
+                                                                        if (canTrigger)
+                                                                        {
+                                                                            _axisLastTrigger[axisKey] = now;
+                                                                            if (_mappings.ContainsKey(axisKey))
+                                                                            {
+                                                                                Log(string.Format("DEBUG HID Axis: {0} Triggered! Value: {1}", axisKey, currentValue));
+                                                                                triggeredActions.Add(_mappings[axisKey]);
+                                                                            }
+                                                                            else if (_cfgShowUnmappedInputs)
+                                                                            {
+                                                                                string[] parts = axisKey.Split('_');
+                                                                                if (parts.Length >= 3) triggeredActions.Add(parts[1].ToUpper() + " " + parts[2].ToUpper());
+                                                                                else triggeredActions.Add(axisKey);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    else if (!outsideDeadzone)
+                                                                    {
+                                                                        // Reset if it returns to center
+                                                                        _lastAxisValues[axisKey] = (uint)center;
+                                                                        if (_axisLastTrigger.ContainsKey(axisKey)) _axisLastTrigger.Remove(axisKey);
+                                                                    }
+                                                                }
+                                                            }
                                                         }
-                                                    }
-                                                    else if (usagesStatus != -1072627702) // HIDP_STATUS_INCOMPATIBLE_REPORT_ID
-                                                    {
-                                                        Log("HID Parsing Error (HidP_GetUsages): " + usagesStatus);
                                                     }
                                                 }
                                                 else
                                                 {
-                                                    Log("HID Parsing Error (HidP_GetCaps): " + capsStatus);
+                                                    Log("HID Parsing Error (HidP_GetValueCaps failed)");
                                                 }
                                             }
                                         }
-                                        finally
-                                        {
-                                            Marshal.FreeHGlobal(pPreparsedData);
-                                        }
+                                        else { Log("HID Parsing Error (HidP_GetCaps): " + capsStatus); }
                                     }
                                 }
                                 catch (Exception hidEx)
@@ -422,6 +800,12 @@ namespace SCOverlay
                                         {
                                             triggeredActions.Add(_mappings[jsKey]);
                                         }
+                                        else if (_cfgShowUnmappedInputs)
+                                        {
+                                            string[] parts = jsKey.Split('_');
+                                            if (parts.Length >= 3) triggeredActions.Add(parts[1].ToUpper() + " " + parts[2].ToUpper());
+                                            else triggeredActions.Add(jsKey);
+                                        }
                                     }
                                 }
                             }
@@ -437,6 +821,10 @@ namespace SCOverlay
             }
             catch (Exception ex) { Log("Input error: " + ex.Message); }
         }
+
+        // -------------------------------------------------------------------
+        //  Key name mapping
+        // -------------------------------------------------------------------
 
         private string GetStarCitizenKeyName(Keys key, bool isE0)
         {
@@ -472,6 +860,10 @@ namespace SCOverlay
             }
         }
 
+        // -------------------------------------------------------------------
+        //  Display
+        // -------------------------------------------------------------------
+
         private void ShowText(string text)
         {
             _currentText = text;
@@ -484,28 +876,67 @@ namespace SCOverlay
             if (!string.IsNullOrEmpty(_currentText))
             {
                 SizeF size = e.Graphics.MeasureString(_currentText, _displayFont);
-                float x = this.Width - size.Width - 50;
-                float y = this.Height - size.Height - 50;
-                e.Graphics.DrawString(_currentText, _displayFont, Brushes.Black, x + 2, y + 2);
-                e.Graphics.DrawString(_currentText, _displayFont, Brushes.LimeGreen, x, y);
+                float x, y;
+
+                if (_cfgPosition == "center")
+                {
+                    x = (this.Width - size.Width) / 2;
+                    y = (this.Height - size.Height) / 2;
+                }
+                else // "bottom-right" (default)
+                {
+                    x = this.Width - size.Width - 50;
+                    y = this.Height - size.Height - 50;
+                }
+
+                // Shadow
+                e.Graphics.DrawString(_currentText, _displayFont, _shadowBrush, x + 2, y + 2);
+                // Text
+                e.Graphics.DrawString(_currentText, _displayFont, _textBrush, x, y);
             }
         }
 
+        // -------------------------------------------------------------------
+        //  Logging
+        // -------------------------------------------------------------------
+
         private void Log(string message) 
         { 
+            _logQueue.Enqueue(DateTime.Now + ": " + message + "\r\n"); 
+        }
+
+        private void LogFlushCallback(object state)
+        {
+            FlushLogQueue();
+        }
+
+        private void FlushLogQueue()
+        {
+            if (_logQueue.IsEmpty) return;
+
             try 
-            { 
-                if (File.Exists(_logPath))
+            {
+                StringBuilder sb = new StringBuilder();
+                string msg;
+                while (_logQueue.TryDequeue(out msg))
                 {
-                    long length = new FileInfo(_logPath).Length;
-                    if (length > MAX_LOG_SIZE)
-                    {
-                        string bakPath = _logPath + ".bak";
-                        if (File.Exists(bakPath)) File.Delete(bakPath);
-                        File.Move(_logPath, bakPath);
-                    }
+                    sb.Append(msg);
                 }
-                File.AppendAllText(_logPath, DateTime.Now + ": " + message + "\r\n"); 
+
+                if (sb.Length > 0)
+                {
+                    if (File.Exists(_logPath))
+                    {
+                        long length = new FileInfo(_logPath).Length;
+                        if (length > MAX_LOG_SIZE)
+                        {
+                            string bakPath = _logPath + ".bak";
+                            if (File.Exists(bakPath)) File.Delete(bakPath);
+                            File.Move(_logPath, bakPath);
+                        }
+                    }
+                    File.AppendAllText(_logPath, sb.ToString());
+                }
             } 
             catch { } 
         }
