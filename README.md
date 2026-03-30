@@ -3,6 +3,12 @@
 **SCOverlay** is a lightweight, external, and transparent overlay for [Star Citizen](https://robertsspaceindustries.com/). It displays the names of in-game actions (e.g., "Landing Gear", "Quantum Drive") when you press the mapped buttons on your keyboard, joystick, or gamepad.
 
 **The main feature of this project is its strict Anti-Cheat Safety.** The program operates entirely at the OS-level: it does not inject DLLs into the game process and does not hook DirectX or WinAPI functions, entirely eliminating the risk of Easy Anti-Cheat (EAC) bans.
+![scr1](https://github.com/user-attachments/assets/0747fbcb-8f33-45ac-a294-99429cdd5653)
+
+
+
+
+
 
 ## 🚀 Key Features
 
